@@ -1,0 +1,20 @@
+---
+- name: Reboot server
+  shell: '/bin/sleep 2 && /sbin/shutdown -r now "Reboot triggered by Ansible"'
+  async: 1
+  poll: 0
+  ignore_errors: true
+  when: not ansible_check_mode
+
+- name: Wait for the server to finish rebooting
+  become: false
+  become_user: root
+  become_method: sudo
+  local_action:
+    module: wait_for
+      host="{{ inventory_hostname }}"
+      port=22
+      delay=15
+      timeout=300
+      state=started
+  when: not ansible_check_mode

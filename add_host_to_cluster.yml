@@ -1,0 +1,311 @@
+##########################################################
+###############    Cloudera Manager API    ###############
+##########################################################
+#
+# API Reference:
+# https://cloudera.github.io/cm_api/apidocs/v19/index.html
+#
+# I'm trying to 
+#  1) add a new host to the cluster.
+#  2) configure needed services
+#
+#  After that I will refactor this play into roles. So you
+#  can assign certain hosts to roles to configure services
+---
+- hosts: NameNode01
+  name: "Get credentials to use Cloudera Manager API"
+  vars_prompt:
+  - name: 'cloudera_api_user'
+    prompt: 'Your username for cloudera manager admin user'
+    private: no
+  - name: 'cloudera_api_password'
+    prompt: 'Your password for cloudera manager admin user'
+    private: yes
+
+  tasks:
+    - name: "Set variables"
+      set_fact:
+        cloudera_baseurl_api: "http://{{ inventory_hostname }}.local:7180/api"
+        cloudera_domain: .local
+        cloudera_hostTemplate_startRoles: "true"
+        cloudera_cmRepoUrl: "http://webserver.local/repositories/cm/latest"
+        cloudera_root_user: "root"
+        cloudera_root_id_rsa: "/root/.ssh/id_rsa"
+        cloudera_debug: true
+
+    - name: "Get API version"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/version"
+        user: "{{ cloudera_api_user }}"  
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_version
+
+    - name: "Set API version"
+      set_fact:
+        cloudera_version: "{{ ret_cloudera_version.content }}"
+
+    - name: "Get internal cluster name"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters"
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_clusters
+
+    - name: "Set internal cluster name"
+      set_fact:
+        cloudera_clustername: "{{ ret_cloudera_clusters.json['items'][0].name }}"
+
+    - name: "Get edgenodes from inventory"
+      set_fact:
+        cloudera_hosts_to_add_temp: "{{ cloudera_hosts_to_add_temp|default([]) + [{ 'inventory_hostname': item, 'hostTemplate': 'edgenodes' }] }}"
+      with_items:
+        - "{{ groups['edgenodes'] }}"
+
+    - name: "Get datanodes from inventory"
+      set_fact:
+        cloudera_hosts_to_add_temp: "{{ cloudera_hosts_to_add_temp|default([]) + [{ 'inventory_hostname': item, 'hostTemplate': 'datanodes' }] }}"
+      with_items:
+        - "{{ groups['datanodes'] }}"
+
+    - fail:
+        msg: "No Hosts to add."
+      when: cloudera_hosts_to_add_temp is not defined or cloudera_hosts_to_add_temp|length < 1
+
+    - name: "Sanitize hosts without FQDN"
+      set_fact:
+        cloudera_hosts_to_add_sanitized_temp: "{{ cloudera_hosts_to_add_sanitized_temp|default([]) + [ { 'fqdn': item.inventory_hostname + cloudera_domain, 'hostname': item.inventory_hostname, 'hostTemplate': item.hostTemplate } ] }}"
+      with_items: "{{ cloudera_hosts_to_add_temp }}"
+      when: not item.inventory_hostname | search( cloudera_domain )
+
+    - name: "Add hosts with FQDN"
+      set_fact:
+        cloudera_hosts_to_add_sanitized_temp: "{{ cloudera_hosts_to_add_sanitized_temp|default([]) + [ { 'fqdn': item.inventory_hostname, 'hostname': item.inventory_hostname|replace(cloudera_domain,''), 'hostTemplate': item.hostTemplate} ] }}"
+      with_items: "{{ cloudera_hosts_to_add_temp }}"
+      when: item.inventory_hostname | search( cloudera_domain )
+
+    - name: "Get hosts in cluster"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/hosts"
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+
+    - set_fact:
+        cloudera_commissioned_hosts_temp: "{{ cloudera_commissioned_hosts_temp|default([]) + [ item.hostname ]}}"
+      with_items: 
+        - "{{ ret_cloudera_temp.json['items'] }}" 
+
+    - name: "Ignore hosts already in cluster"
+      set_fact: 
+        cloudera_hosts_to_add_list: "{{ cloudera_hosts_to_add_list|default([]) + [ item ] }}"
+        cloudera_hosts_to_add_fqdn_list: "{{ cloudera_hosts_to_add_fqdn_list|default([]) + [ item.fqdn ] }}"
+      with_items:
+        - "{{ cloudera_hosts_to_add_sanitized_temp }}"
+      when: item.fqdn not in cloudera_commissioned_hosts_temp
+
+    - pause:
+        prompt: "Following hosts will be added: {{ cloudera_hosts_to_add_list }}"
+
+    - name: "Install CM-Agents on host"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/cm/commands/hostInstall/"
+        method: POST
+        body_format: json
+        body:
+          hostNames: "{{ cloudera_hosts_to_add_fqdn_list }}" 
+          userName: "{{ cloudera_root_user }}"
+          privateKey: "{{ lookup('file', cloudera_root_id_rsa) }}"
+          cmRepoUrl: "{{ cloudera_cmRepoUrl }}"
+          javaInstallStrategy: "NONE"
+          unlimitedJCE: false
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_clusters_hostInstall
+
+    - name: "Set hostInstall command id"
+      set_fact:
+        cloudera_clusters_hostInstallCommandId: "{{ ret_cloudera_clusters_hostInstall.json['id'] }}"
+
+    - name: "Wait for hostInstall to finish "
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/commands/{{ cloudera_clusters_hostInstallCommandId }}"
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_temp
+      until: ret_temp.json['active'] == false
+      retries: 30
+      delay: 20
+
+    - fail:
+        msg: "hostInstall failed. See {{ cloudera_baseurl_api }}/{{ cloudera_version }}/commands/{{ cloudera_clusters_hostInstallCommandId }}"
+      when: ret_temp.json['success'] == false
+
+    - name: "Get hostIDs"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/hosts"
+        method: GET
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+
+    - name: "Get hostIDs for new hosts"
+      set_fact:
+        cloudera_hostid_fqdn: "{{ cloudera_hostid_fqdn|default([]) + [ item.hostId ] }}"
+      with_items: 
+        - "{{ ret_cloudera_temp.json['items'] }}"
+      when: item.hostname in cloudera_hosts_to_add_fqdn_list
+
+    - name: "Wait for good health"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/hosts/{{ item }}"
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_temp
+      with_items: "{{ cloudera_hostid_fqdn }}"
+      until: ret_temp.json['healthSummary'] == 'GOOD'
+      retries: 2 #45
+      delay: 20
+      ignore_errors: yes
+
+    - name: "Create apiHostRef-Object for REST-Call"
+      set_fact:
+        cloudera_apiHostRef: "{{ cloudera_apiHostRef|default([]) + [{ 'hostId': item }] }}"
+      with_items:
+        - "{{ cloudera_hostid_fqdn}}"
+
+    - name: "Add hosts to cluster"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/hosts"
+        method: POST
+        body_format: json
+        body:
+          items: "{{ cloudera_apiHostRef }}"
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+
+    - name: "Waiting: Adding host to cluster ..."
+      import_tasks: waitForApi.yml
+      vars: 
+        - wait_for_api_url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/parcels"
+        - wait_for_api_user: "{{ cloudera_api_user }}" 
+        - wait_for_api_password: "{{ cloudera_api_password }}"
+        - wait_for_api_until: ret_cloudera_temp.json['items'][0].stage == 'ACTIVATED'
+
+    - name: "Get Parcel information"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/parcels"
+        method: GET
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+
+    - name: "Set parcel information"
+      set_fact:
+        cloudera_clusters_parcels: "{{ ret_cloudera_temp.json['items'] }}"
+
+    - name: "Download Parcels on hosts"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/parcels/products/{{ item[1].product }}/versions/{{ item[1].version }}/commands/startDownload"
+        method: POST
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+      with_nested:
+        - "{{ cloudera_hosts_to_add_fqdn_list }}"
+        - "{{ cloudera_clusters_parcels }}"
+      when:
+        - item[1].clusterRef.clusterName == cloudera_clustername
+        - item[1].stage == "ACTIVATED"
+
+    - name: "Distribute Parcels on hosts"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/parcels/products/{{ item[1].product }}/versions/{{ item[1].version }}/commands/startDistribution"
+        method: POST
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+      with_nested:
+        - "{{ cloudera_hosts_to_add_fqdn_list }}"
+        - "{{ cloudera_clusters_parcels }}"
+      when:
+        - item[1].clusterRef.clusterName == cloudera_clustername
+        - item[1].stage == "ACTIVATED"
+
+    - name: "Activate Parcels on hosts"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/parcels/products/{{ item[1].product }}/versions/{{ item[1].version }}/commands/activate"
+        method: POST
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+      with_nested:
+        - "{{ cloudera_hosts_to_add_fqdn_list }}"
+        - "{{ cloudera_clusters_parcels }}"
+      when:
+        - item[1].clusterRef.clusterName == cloudera_clustername
+        - item[1].stage == "ACTIVATED"
+
+    - name: "Apply HostTemplate to host"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/hostTemplates/{{ item.hostTemplate }}/commands/applyHostTemplate?startRoles={{ cloudera_hostTemplate_startRoles }}"
+        method: POST
+        body_format: json
+        body:
+          items: 
+            - "{{ item.fqdn }}"
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+      with_items:
+        - "{{ cloudera_hosts_to_add_list }}"
+
+    - name: "Deploy cluster client config"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/commands/deployClusterClientConfig"
+        method: POST
+        body_format: json
+        body:
+          items: "{{ cloudera_apiHostRef }}"
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+
+    - name: "Waiting: Deploying cluster client config"
+      import_tasks: waitForApi.yml
+      vars:
+        - wait_for_api_url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/commands/{{ ret_cloudera_temp.json['id'] }}"
+        - wait_for_api_user: "{{ cloudera_api_user }}"
+        - wait_for_api_password: "{{ cloudera_api_password }}"
+        - wait_for_api_until: ret_cloudera_temp.json['active'] == false
+
+    - name: "Deploy service client config"
+      uri:
+        url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/clusters/{{ cloudera_clustername }}/commands/deployClientConfig"
+        method: POST
+        user: "{{ cloudera_api_user }}"
+        password: "{{ cloudera_api_password }}"
+        return_content: yes
+      register: ret_cloudera_temp
+
+    - name: "Waiting: Deploying client config"
+      import_tasks: waitForApi.yml
+      vars:
+        - wait_for_api_url: "{{ cloudera_baseurl_api }}/{{ cloudera_version }}/commands/{{ ret_cloudera_temp.json['id'] }}"
+        - wait_for_api_user: "{{ cloudera_api_user }}"
+        - wait_for_api_password: "{{ cloudera_api_password }}"
+        - wait_for_api_until: ret_cloudera_temp.json['active'] == false

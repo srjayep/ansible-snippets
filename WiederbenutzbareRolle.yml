@@ -1,0 +1,32 @@
+- name: "Create {{ cul_dest }}"
+  file:
+    path: '{{ cul_dest }}'
+    state: directory
+  when: not ansible_check_mode
+
+- name: "Unarchive {{ cul_src }}"
+  unarchive:
+    src: "{{ cul_src }}"
+    dest: "{{ cul_dest }}"
+    remote_src: yes # Wenn das an ist, holt sich der Host die Datei lokal. No bedeutet, dass der Server die Datei zum Host überträgt und dann antpackt.
+    list_files: yes
+  register: cul_unarchive_out
+  when: not ansible_check_mode
+
+- name: "Link to latest {{ cul_package_name }}"
+  file:
+    state: link
+    src: "{{ cul_dest }}/{{ cul_unarchive_out.files[0] | regex_search('^[^/]+') }}"
+    dest: "{{ cul_dest }}/latest"
+  when: not ansible_check_mode
+
+### Um es einzubinden:
+#---
+#- import_role:
+#    name: create_unarchive_link
+#  vars:
+#    cul_package_name: 'scala'
+#    cul_src: '/software/scala/scala-2.12.1.tgz'
+#    cul_dest: '/opt/scala'
+#  tags: cul_scala
+#  when: not ansible_check_mode

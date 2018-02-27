@@ -1,0 +1,11 @@
+---
+- name: "waitForApi.yml"
+  uri:
+    url: "{{ wait_for_api_url }}" 
+    user: "{{ wait_for_api_user }}"
+    password: "{{ wait_for_api_password }}"
+    return_content: yes
+  register: ret_cloudera_temp
+  until: wait_for_api_until
+  retries: 60
+  delay: 5
